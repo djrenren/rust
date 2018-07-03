@@ -19,6 +19,7 @@ use std::iter;
 use std::slice;
 use std::mem;
 use std::vec;
+use std::collections::HashMap;
 use attr::{self, HasAttrs};
 use syntax_pos::{self, DUMMY_SP, NO_EXPANSION, Span, FileMap, BytePos};
 
@@ -59,7 +60,7 @@ struct TestCtxt<'a> {
     span_diagnostic: &'a errors::Handler,
     path: Vec<Ident>,
     ext_cx: ExtCtxt<'a>,
-    testfns: Vec<Test>,
+    tests: HashMap<Symbol, Vec<Test>>,
     reexport_test_harness_main: Option<Symbol>,
     is_libtest: bool,
     ctxt: SyntaxContext,
@@ -93,6 +94,21 @@ pub fn modify_for_testing(sess: &ParseSess,
     }
 }
 
+fn get_framework(i: &ast::Item) -> Option<Symbol> {
+    attr::find_by_name(&i.attrs, "test")
+        .map(|attr| {
+            attr.value_str()
+                .unwrap_or_else(|| Symbol::intern("test"))
+        })
+        .or_else(|| {
+            if attr::contains_name(&i.attrs, "bench") {
+                Some(Symbol::intern("bench"))
+            } else {
+                None
+            }
+        })
+}
+
 struct TestHarnessGenerator<'a> {
     cx: TestCtxt<'a>,
     tests: Vec<Ident>,
@@ -109,6 +125,7 @@ impl<'a> fold::Folder for TestHarnessGenerator<'a> {
         // generated for the test harness
         let (mod_, reexport) = mk_test_module(&mut self.cx);
         if let Some(re) = reexport {
+            debug!("adding the reexport!\n");
             folded.module.items.push(re)
         }
         folded.module.items.push(mod_);
@@ -122,27 +139,29 @@ impl<'a> fold::Folder for TestHarnessGenerator<'a> {
         }
         debug!("current path: {}", path_name_i(&self.cx.path));
 
-        if is_test_fn(&self.cx, &i) || is_bench_fn(&self.cx, &i) {
-            match i.node {
-                ast::ItemKind::Fn(_, header, _, _) => {
-                    if header.unsafety == ast::Unsafety::Unsafe {
-                        let diag = self.cx.span_diagnostic;
-                        diag.span_fatal(
-                            i.span,
-                            "unsafe functions cannot be used for tests"
-                        ).raise();
+        if let Some(frame) = get_framework(&i) {
+            // libtest and bench tests have special requirements
+            if is_test_fn(&self.cx, &i) || is_bench_fn(&self.cx, &i) {
+                match i.node {
+                    ast::ItemKind::Fn(_, header, _, _) => {
+                        if header.unsafety == ast::Unsafety::Unsafe {
+                            let diag = self.cx.span_diagnostic;
+                            diag.span_fatal(
+                                i.span,
+                                "unsafe functions cannot be used for tests"
+                            ).raise();
+                        }
+                        if header.asyncness.is_async() {
+                            let diag = self.cx.span_diagnostic;
+                            diag.span_fatal(
+                                i.span,
+                                "async functions cannot be used for tests"
+                            ).raise();
+                        }
                     }
-                    if header.asyncness.is_async() {
-                        let diag = self.cx.span_diagnostic;
-                        diag.span_fatal(
-                            i.span,
-                            "async functions cannot be used for tests"
-                        ).raise();
-                    }
+                    _ => {},
                 }
-                _ => {},
             }
-
             debug!("this is a test function");
             let test = Test {
                 span: i.span,
@@ -152,7 +171,7 @@ impl<'a> fold::Folder for TestHarnessGenerator<'a> {
                 should_panic: should_panic(&i, &self.cx),
                 allow_fail: is_allowed_fail(&i),
             };
-            self.cx.testfns.push(test);
+            self.cx.tests.entry(frame).or_insert(Vec::new()).push(test);
             self.tests.push(i.ident);
         }
 
@@ -296,7 +315,7 @@ fn generate_test_harness(sess: &ParseSess,
         span_diagnostic: sd,
         ext_cx: ExtCtxt::new(sess, econfig, resolver),
         path: Vec::new(),
-        testfns: Vec::new(),
+        tests: HashMap::new(),
         reexport_test_harness_main,
         // NB: doesn't consider the value of `--crate-name` passed on the command line.
         is_libtest: attr::find_crate_name(&krate.attrs).map(|s| s == "test").unwrap_or(false),
@@ -343,7 +362,7 @@ enum BadTestSignature {
 }
 
 fn is_test_fn(cx: &TestCtxt, i: &ast::Item) -> bool {
-    let has_test_attr = attr::contains_name(&i.attrs, "test");
+    let has_test_attr = get_framework(i).map_or(false, |f| f == "test");
 
     fn has_test_signature(_cx: &TestCtxt, i: &ast::Item) -> HasTestSignature {
         let has_should_panic_attr = attr::contains_name(&i.attrs, "should_panic");
@@ -402,7 +421,7 @@ fn is_test_fn(cx: &TestCtxt, i: &ast::Item) -> bool {
 }
 
 fn is_bench_fn(cx: &TestCtxt, i: &ast::Item) -> bool {
-    let has_bench_attr = attr::contains_name(&i.attrs, "bench");
+    let has_bench_attr = get_framework(i).map_or(false, |f| f == "bench");
 
     fn has_bench_signature(_cx: &TestCtxt, i: &ast::Item) -> bool {
         match i.node {
@@ -495,8 +514,8 @@ mod __test {
 
 */
 
-fn mk_std(cx: &TestCtxt) -> P<ast::Item> {
-    let id_test = Ident::from_str("test");
+fn mk_extern(cx: &TestCtxt, name: &str) -> P<ast::Item> {
+    let id_test = Ident::from_str(name);
     let sp = ignored_span(cx, DUMMY_SP);
     let (vi, vis, ident) = if cx.is_libtest {
         (ast::ItemKind::Use(P(ast::UseTree {
@@ -530,22 +549,30 @@ fn mk_main(cx: &mut TestCtxt) -> P<ast::Item> {
     let sp = ignored_span(cx, DUMMY_SP);
     let ecx = &cx.ext_cx;
 
-    // test::test_main_static
-    let test_main_path =
-        ecx.path(sp, vec![Ident::from_str("test"), Ident::from_str("test_main_static")]);
+    let test_invocations = cx.tests.iter().map(|(frame, tests)| {
+        // test::test_main_static
+        let test_main_path =
+            ecx.path(sp, vec![Ident::from_str(&frame.as_str()), Ident::from_str("test_main_static")]);
 
-    // test::test_main_static(...)
-    let test_main_path_expr = ecx.expr_path(test_main_path);
-    let tests_ident_expr = ecx.expr_ident(sp, Ident::from_str("TESTS"));
-    let call_test_main = ecx.expr_call(sp, test_main_path_expr,
-                                       vec![tests_ident_expr]);
-    let call_test_main = ecx.stmt_expr(call_test_main);
+        // test::test_main_static(...)
+        let test_main_path_expr = ecx.expr_path(test_main_path);
+        let call_test_main = if frame.as_str() == "test" || frame.as_str() == "bench" {
+            ecx.expr_call(sp, test_main_path_expr,
+                    vec![mk_libtest_tests(&cx, tests)])
+        } else {
+            ecx.expr_call(sp, test_main_path_expr,
+                    vec![mk_custom_tests(&cx, tests)])
+
+        };
+        let call_test_main = ecx.stmt_expr(call_test_main);
+        call_test_main
+    }).collect();
     // #![main]
     let main_meta = ecx.meta_word(sp, Symbol::intern("main"));
     let main_attr = ecx.attribute(sp, main_meta);
     // pub fn main() { ... }
     let main_ret_ty = ecx.ty(sp, ast::TyKind::Tup(vec![]));
-    let main_body = ecx.block(sp, vec![call_test_main]);
+    let main_body = ecx.block(sp, test_invocations);
     let main = ast::ItemKind::Fn(ecx.fn_decl(vec![], ast::FunctionRetTy::Ty(main_ret_ty)),
                            ast::FnHeader::default(),
                            ast::Generics::default(),
@@ -563,18 +590,15 @@ fn mk_main(cx: &mut TestCtxt) -> P<ast::Item> {
 
 fn mk_test_module(cx: &mut TestCtxt) -> (P<ast::Item>, Option<P<ast::Item>>) {
     // Link to test crate
-    let import = mk_std(cx);
-
-    // A constant vector of test descriptors.
-    let tests = mk_tests(cx);
+    let mut items: Vec<P<ast::Item>> = cx.tests.keys().map(|i| mk_extern(cx, &i.as_str())).collect();
 
     // The synthesized main function which will call the console test runner
     // with our list of tests
     let mainfn = mk_main(cx);
-
+    items.push(mainfn);
     let testmod = ast::Mod {
         inner: DUMMY_SP,
-        items: vec![import, mainfn, tests],
+        items,
     };
     let item_ = ast::ItemKind::Mod(testmod);
     let mod_ident = Ident::with_empty_ctxt(Symbol::gensym("__test"));
@@ -611,6 +635,7 @@ fn mk_test_module(cx: &mut TestCtxt) -> (P<ast::Item>, Option<P<ast::Item>>) {
     });
 
     debug!("Synthetic test module:\n{}\n", pprust::item_to_string(&item));
+    debug!("Reexport thingy:\n{}\n", if let Some(ref e) = reexport {pprust::item_to_string(e)} else {"womp_womp".to_string()});
 
     (item, reexport)
 }
@@ -638,40 +663,48 @@ fn path_name_i(idents: &[Ident]) -> String {
     path_name
 }
 
-fn mk_tests(cx: &TestCtxt) -> P<ast::Item> {
-    // The vector of test_descs for this crate
-    let test_descs = mk_test_descs(cx);
-
-    // FIXME #15962: should be using quote_item, but that stringifies
-    // __test_reexports, causing it to be reinterned, losing the
-    // gensym information.
-    let sp = ignored_span(cx, DUMMY_SP);
+fn mk_custom_tests(cx: &TestCtxt, tests: &[Test]) -> P<ast::Expr> {
+    debug!("building test vector from {} tests", tests.len());
     let ecx = &cx.ext_cx;
-    let struct_type = ecx.ty_path(ecx.path(sp, vec![ecx.ident_of("self"),
-                                                    ecx.ident_of("test"),
-                                                    ecx.ident_of("TestDescAndFn")]));
-    let static_lt = ecx.lifetime(sp, keywords::StaticLifetime.ident());
-    // &'static [self::test::TestDescAndFn]
-    let static_type = ecx.ty_rptr(sp,
-                                  ecx.ty(sp, ast::TyKind::Slice(struct_type)),
-                                  Some(static_lt),
-                                  ast::Mutability::Immutable);
-    // static TESTS: $static_type = &[...];
-    ecx.item_const(sp,
-                   ecx.ident_of("TESTS"),
-                   static_type,
-                   test_descs)
-}
-
-fn mk_test_descs(cx: &TestCtxt) -> P<ast::Expr> {
-    debug!("building test vector from {} tests", cx.testfns.len());
 
     P(ast::Expr {
         id: ast::DUMMY_NODE_ID,
         node: ast::ExprKind::AddrOf(ast::Mutability::Immutable,
             P(ast::Expr {
                 id: ast::DUMMY_NODE_ID,
-                node: ast::ExprKind::Array(cx.testfns.iter().map(|test| {
+                node: ast::ExprKind::Array(tests.iter().map(|test| {
+                    let mut visible_path = vec![];
+                    if cx.features.extern_absolute_paths {
+                        visible_path.push(keywords::Crate.ident());
+                    }
+                    match cx.toplevel_reexport {
+                        Some(id) => visible_path.push(id),
+                        None => {
+                            let diag = cx.span_diagnostic;
+                            diag.bug("expected to find top-level re-export name, but found None");
+                        }
+                    };
+                    visible_path.extend_from_slice(&test.path[..]);
+                    ecx.expr_addr_of(DUMMY_SP,
+                        ecx.expr_path(ecx.path_global(DUMMY_SP,visible_path)))
+                }).collect()),
+                span: DUMMY_SP,
+                attrs: ast::ThinVec::new(),
+            })),
+        span: DUMMY_SP,
+        attrs: ast::ThinVec::new(),
+    })
+}
+
+fn mk_libtest_tests(cx: &TestCtxt, tests: &[Test]) -> P<ast::Expr> {
+    debug!("building test vector from {} tests", tests.len());
+
+    P(ast::Expr {
+        id: ast::DUMMY_NODE_ID,
+        node: ast::ExprKind::AddrOf(ast::Mutability::Immutable,
+            P(ast::Expr {
+                id: ast::DUMMY_NODE_ID,
+                node: ast::ExprKind::Array(tests.iter().map(|test| {
                     mk_test_desc_and_fn_rec(cx, test)
                 }).collect()),
                 span: DUMMY_SP,
